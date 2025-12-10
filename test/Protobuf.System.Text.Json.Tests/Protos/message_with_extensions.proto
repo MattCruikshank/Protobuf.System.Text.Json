@@ -1,0 +1,19 @@
+edition = "2023";
+
+option csharp_namespace = "System.Text.Json.Protobuf.Tests";
+
+message BaseMessage {
+  string name = 1;
+  extensions 100 to 199;
+}
+
+message ExtendedData {
+  string value = 1;
+  int32 count = 2;
+}
+
+extend BaseMessage {
+  string string_extension = 100;
+  int32 int_extension = 101;
+  ExtendedData complex_extension = 102;
+}
