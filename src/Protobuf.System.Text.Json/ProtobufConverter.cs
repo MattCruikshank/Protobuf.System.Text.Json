@@ -101,8 +101,22 @@ internal class ProtobufConverter<T> : JsonConverter<T?> where T : class, IMessag
             }
 
             var propertyName = reader.GetString();
-            
-            if (propertyName == null || !_fieldsLookup.TryGetValue(propertyName, out var fieldInfo))
+
+            if (propertyName == null)
+            {
+                reader.Read();
+                continue;
+            }
+
+            // Check if this is an extension (property name starts with '[')
+            if (propertyName.StartsWith("[") && propertyName.EndsWith("]"))
+            {
+                // This is an extension field
+                ReadExtension(ref reader, obj, propertyName, options);
+                continue;
+            }
+
+            if (!_fieldsLookup.TryGetValue(propertyName, out var fieldInfo))
             {
                 // We need to call TrySkip instead of Skip as Skip may throw exception when called in DeserializeAsync
                 // context https://github.com/dotnet/runtime/issues/39795
@@ -140,7 +154,7 @@ internal class ProtobufConverter<T> : JsonConverter<T?> where T : class, IMessag
                 if (_defaultIgnoreCondition is JsonIgnoreCondition.Never or not JsonIgnoreCondition.WhenWritingDefault)
                 {
                     writer.WritePropertyName(fieldInfo.JsonName);
-                    fieldInfo.Converter.Write(writer, propertyValue, options); 
+                    fieldInfo.Converter.Write(writer, propertyValue, options);
                 }
             }
             else if (obj is null && _defaultIgnoreCondition == JsonIgnoreCondition.Never)
@@ -150,6 +164,268 @@ internal class ProtobufConverter<T> : JsonConverter<T?> where T : class, IMessag
             }
         }
 
+        // Write extensions if the message supports them
+        WriteExtensions(writer, value, options);
+
         writer.WriteEndObject();
+    }
+
+    private void WriteExtensions(Utf8JsonWriter writer, T value, JsonSerializerOptions options)
+    {
+        // Check if this message type supports extensions (implements IExtendableMessage)
+        if (value is not IMessage message)
+        {
+            return;
+        }
+
+        // Get the message descriptor
+        var descriptor = message.Descriptor;
+
+        // Find all extension fields registered for this message type
+        // Extensions are registered in the file descriptor
+        // Check dependencies first, then the file itself
+        var filesToCheck = new List<FileDescriptor>();
+        foreach (var dep in descriptor.File.Dependencies)
+        {
+            filesToCheck.Add(dep);
+        }
+        filesToCheck.Add(descriptor.File);
+
+        foreach (var file in filesToCheck)
+        {
+            foreach (var extension in file.Extensions.UnorderedExtensions)
+            {
+                // Note: extension.ContainingType is null for file-level extensions
+                // We'll try to get the value for all extensions and skip if not set
+                if (extension == null)
+                {
+                    continue;
+                }
+
+                // Use the GetExtension method on the message
+                // We need to find the static Extension<TMessage, TValue> field
+                // Look in the file's reflection class for extension fields
+                var extensionField = FindStaticExtensionField(extension);
+                if (extensionField == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    // Call message.GetExtension(extension) - we use the generic version
+                    // The method signature is: TValue GetExtension<TValue>(Extension<TMessage, TValue> extension)
+                    var extensionType = extensionField.GetType();
+                    if (!extensionType.IsGenericType)
+                    {
+                        continue;
+                    }
+
+                    var genericArgs = extensionType.GetGenericArguments();
+                    if (genericArgs.Length != 2)
+                    {
+                        continue;
+                    }
+
+                    var messageType = genericArgs[0]; // Should be T
+                    var valueType = genericArgs[1];   // The actual value type
+
+                    // Get the generic GetExtension method
+                    MethodInfo? getExtensionMethod = null;
+                    foreach (var method in typeof(T).GetMethods())
+                    {
+                        if (method.Name == "GetExtension" && method.IsGenericMethod)
+                        {
+                            getExtensionMethod = method;
+                            break;
+                        }
+                    }
+
+                    if (getExtensionMethod == null)
+                    {
+                        continue;
+                    }
+
+                    var genericGetExtension = getExtensionMethod.MakeGenericMethod(valueType);
+                    var extensionValue = genericGetExtension.Invoke(value, new[] { extensionField });
+
+                    if (extensionValue == null)
+                    {
+                        continue;
+                    }
+
+                    // Check if this is the default value (for primitive types, we might want to skip defaults)
+                    // For now, write it anyway
+
+                    // Write the extension in protobuf JSON format: "[extensionName]": value
+                    // Use JsonName to get the camelCase version of the field name
+                    var extensionJsonName = $"[{extension.JsonName}]";
+                    writer.WritePropertyName(extensionJsonName);
+
+                    // Serialize the extension value
+                    JsonSerializer.Serialize(writer, extensionValue, valueType, options);
+                }
+                catch (Exception)
+                {
+                    // Skip extensions that fail
+                    continue;
+                }
+            }
+        }
+    }
+
+    private static object? FindStaticExtensionField(FieldDescriptor extension)
+    {
+        // The extension is stored as a static field in a class named [FileName]Extensions
+        // We need to search all loaded assemblies for this
+        var extensionName = extension.Name;
+
+        // Try to find the extension in the same assembly as the message type
+        var assembly = typeof(T).Assembly;
+        foreach (var type in assembly.GetTypes())
+        {
+            if (!type.Name.EndsWith("Extensions"))
+            {
+                continue;
+            }
+
+            // Look for static fields that are Extension<T, TValue>
+            var fields = type.GetFields(BindingFlags.Public | BindingFlags.Static);
+            foreach (var field in fields)
+            {
+                // Extension<T, TValue> will have a generic type name
+                if (!field.FieldType.IsGenericType ||
+                    !field.FieldType.Name.Contains("Extension"))
+                {
+                    continue;
+                }
+
+                var extensionObj = field.GetValue(null);
+                if (extensionObj == null)
+                {
+                    continue;
+                }
+
+                // Check if this is the right extension by comparing field number
+                var fieldNumberProp = extensionObj.GetType().GetProperty("FieldNumber");
+                if (fieldNumberProp != null)
+                {
+                    var fieldNumber = fieldNumberProp.GetValue(extensionObj) as int?;
+                    if (fieldNumber == extension.FieldNumber)
+                    {
+                        return extensionObj;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private void ReadExtension(ref Utf8JsonReader reader, T message, string propertyName, JsonSerializerOptions options)
+    {
+        // Extract extension name from "[extensionName]"
+        var extensionJsonName = propertyName.Substring(1, propertyName.Length - 2);
+
+        // Find the extension field descriptor by JSON name
+        var descriptor = message.Descriptor;
+        FieldDescriptor? extensionDescriptor = null;
+
+        var filesToCheck = new List<FileDescriptor>();
+        foreach (var dep in descriptor.File.Dependencies)
+        {
+            filesToCheck.Add(dep);
+        }
+        filesToCheck.Add(descriptor.File);
+
+        foreach (var file in filesToCheck)
+        {
+            foreach (var ext in file.Extensions.UnorderedExtensions)
+            {
+                if (ext.JsonName == extensionJsonName)
+                {
+                    extensionDescriptor = ext;
+                    break;
+                }
+            }
+
+            if (extensionDescriptor != null)
+            {
+                break;
+            }
+        }
+
+        if (extensionDescriptor == null)
+        {
+            // Unknown extension, skip it
+            reader.Read();
+            _ = reader.TrySkip();
+            return;
+        }
+
+        // Find the static Extension field
+        var extensionField = FindStaticExtensionField(extensionDescriptor);
+        if (extensionField == null)
+        {
+            // Can't find extension field, skip it
+            reader.Read();
+            _ = reader.TrySkip();
+            return;
+        }
+
+        try
+        {
+            // Get the extension type to determine the value type
+            var extensionType = extensionField.GetType();
+            if (!extensionType.IsGenericType)
+            {
+                reader.Read();
+                _ = reader.TrySkip();
+                return;
+            }
+
+            var genericArgs = extensionType.GetGenericArguments();
+            if (genericArgs.Length != 2)
+            {
+                reader.Read();
+                _ = reader.TrySkip();
+                return;
+            }
+
+            var valueType = genericArgs[1];
+
+            // Read the next token (the value)
+            reader.Read();
+
+            // Deserialize the value
+            var value = JsonSerializer.Deserialize(ref reader, valueType, options);
+
+            if (value == null)
+            {
+                return;
+            }
+
+            // Call message.SetExtension(extension, value)
+            MethodInfo? setExtensionMethod = null;
+            foreach (var method in typeof(T).GetMethods())
+            {
+                if (method.Name == "SetExtension" && method.IsGenericMethod)
+                {
+                    setExtensionMethod = method;
+                    break;
+                }
+            }
+
+            if (setExtensionMethod != null)
+            {
+                var genericSetExtension = setExtensionMethod.MakeGenericMethod(valueType);
+                genericSetExtension.Invoke(message, new[] { extensionField, value });
+            }
+        }
+        catch
+        {
+            // Skip on error
+            _ = reader.TrySkip();
+        }
     }
 }
